@@ -16,6 +16,7 @@ package collectors
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/ceph/go-ceph/rados"
@@ -32,6 +33,7 @@ type Conn interface {
 	Shutdown()
 	MonCommand([]byte) ([]byte, string, error)
 	PGCommand([]byte, []byte) ([]byte, string, error)
+	OpenIOContext(string) (*rados.IOContext, error)
 }
 
 // Verify that *rados.Conn implements Conn correctly.
@@ -119,7 +121,7 @@ func (n *NoopConn) MonCommand(args []byte) ([]byte, string, error) {
 	case "osd tree":
 		val, ok := cmd["states"]
 		if !ok {
-			break
+			return []byte(n.cmdOut[n.iteration]["ceph osd tree"]), "", nil
 		}
 
 		st, ok := val.([]interface{})
@@ -140,8 +142,87 @@ func (n *NoopConn) MonCommand(args []byte) ([]byte, string, error) {
 
 	case "osd dump":
 		return []byte(n.cmdOut[n.iteration]["ceph osd dump"]), "", nil
-	}
 
+	case "osd crush rule dump":
+		dumpReturn :=
+			`[
+                           {
+                             "rule_id": 0,
+                             "rule_name": "replicated_rule",
+                             "ruleset": 0,
+                             "type": 1,
+                             "min_size": 1,
+                             "max_size": 10,
+                             "steps": [
+                               {
+                                 "num": 5,
+                                 "op": "set_chooseleaf_tries"
+                               },
+                               {
+                                 "op": "take",
+                                 "item": -1,
+                                 "item_name": "default"
+                               },
+                               {
+                                 "op": "chooseleaf_firstn",
+                                 "num": 0,
+                                 "type": "host"
+                               },
+                               {
+                                 "op": "emit"
+                               }
+                             ]
+                           },
+                           {
+                             "rule_id": 1,
+                             "rule_name": "another-rule",
+                             "ruleset": 1,
+                             "type": 1,
+                             "min_size": 1,
+                             "max_size": 10,
+                             "steps": [
+                               {
+                                 "op": "take",
+                                 "item": -53,
+                                 "item_name": "non-default-root"
+                               },
+                               {
+                                 "op": "chooseleaf_firstn",
+                                 "num": 0,
+                                 "type": "rack"
+                               },
+                               {
+                                 "op": "emit"
+                               }
+                             ]
+                           }
+                         ]`
+		return []byte(dumpReturn), "", nil
+
+	case "osd erasure-code-profile get":
+		switch cmd["name"] {
+		case "ec-4-2":
+			ec42Return :=
+				`{
+			"crush-device-class": "",
+			"crush-failure-domain": "host",
+			"crush-root": "objectdata",
+			"jerasure-per-chunk-alignment": "false",
+			"k": "4",
+			"m": "2",
+			"plugin": "jerasure",
+			"technique": "reed_sol_van",
+			"w": "8"
+		}`
+			return []byte(ec42Return), "", nil
+
+		default:
+			return []byte(""), "", errors.New("unknown erasure code profile")
+		}
+
+	case "osd erasure-code-profile get replicated-ruleset":
+		return []byte("{}"), "", nil
+	}
 	return []byte(n.output), "", nil
 }
 
@@ -162,4 +243,12 @@ func (n *NoopConn) PGCommand(pgid, args []byte) ([]byte, string, error) {
 	}
 
 	return []byte(n.output), "", nil
+}
+
+// OpenIOContext always returns a nil rados.IOContext, and "not implemented"
+// error. The OpenIOContext method in the rados package returns a pointer of
+// rados.IOContext that contains an actual C.rados_ioctx_t, which is not
+// available in this NoopConn.
+func (n *NoopConn) OpenIOContext(pool string) (*rados.IOContext, error) {
+	return nil, errors.New("not implemented")
 }

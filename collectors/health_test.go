@@ -329,6 +329,10 @@ $ sudo ceph -s
 			{
 				"state_name": "active+clean+scrubbing+deep",
 				"count": 5
+			},
+			{
+				"state_name": "active+clean+inconsistent",
+				"count": 1
 			}
 		],
 		"num_pgs": 52000
@@ -336,9 +340,10 @@ $ sudo ceph -s
 	"health": {"summary": [{"severity": "HEALTH_WARN", "summary": "7 pgs undersized"}]}
 }`,
 			regexes: []*regexp.Regexp{
-				regexp.MustCompile(`active_pgs{cluster="ceph"} 7`),
+				regexp.MustCompile(`active_pgs{cluster="ceph"} 8`),
 				regexp.MustCompile(`scrubbing_pgs{cluster="ceph"} 2`),
 				regexp.MustCompile(`deep_scrubbing_pgs{cluster="ceph"} 5`),
+				regexp.MustCompile(`inconsistent_pgs{cluster="ceph"} 1`),
 			},
 		},
 		{
@@ -656,6 +661,10 @@ $ sudo ceph -s
             {
                 "state_name": "active+forced_recovery+undersized",
                 "count": 1
+            },
+            {
+                "state_name": "remapped+incomplete",
+                "count": 2
             }
 		],
 		"num_pgs": 9208,
@@ -689,6 +698,7 @@ $ sudo ceph -s
 				regexp.MustCompile(`forced_recovery_pgs{cluster="ceph"} 1`),
 				regexp.MustCompile(`forced_backfill_pgs{cluster="ceph"} 10`),
 				regexp.MustCompile(`down_pgs{cluster="ceph"} 37`),
+				regexp.MustCompile(`incomplete_pgs{cluster="ceph"} 2`),
 				regexp.MustCompile(`recovery_io_bytes{cluster="ceph"} 65536`),
 				regexp.MustCompile(`recovery_io_keys{cluster="ceph"} 25`),
 				regexp.MustCompile(`recovery_io_objects{cluster="ceph"} 140`),
@@ -714,6 +724,88 @@ $ sudo ceph -s
 				regexp.MustCompile(`pg_state{cluster="ceph",state="forced_recovery"} 1`),
 				regexp.MustCompile(`pg_state{cluster="ceph",state="forced_backfill"} 10`),
 				regexp.MustCompile(`pg_state{cluster="ceph",state="down"} 37`),
+				regexp.MustCompile(`pg_state{cluster="ceph",state="incomplete"} 2`),
+			},
+		},
+		{
+			input: `
+{
+    "mgrmap": {
+        "epoch": 627,
+        "active_gid": 48000003,
+        "active_name": "mon03",
+        "active_addr": "10.0.0.3:6800/1746",
+        "available": true,
+        "standbys": [
+            {
+                "gid": 48000001,
+                "name": "mon01",
+                "available_modules": [
+                    "balancer",
+                    "dashboard",
+                    "influx"
+                ]
+            },
+            {
+                "gid": 48000002,
+                "name": "mon02",
+                "available_modules": [
+                    "balancer",
+                    "dashboard",
+                    "influx"
+                ]
+            }
+        ],
+        "modules": [
+            "dashboard",
+            "restful",
+            "status"
+        ],
+        "available_modules": [
+            "balancer",
+            "dashboard",
+            "influx"
+        ],
+        "services": {
+            "dashboard": "http://mon01:7000/"
+        }
+    }
+}`,
+			regexes: []*regexp.Regexp{
+				regexp.MustCompile(`mgrs_active{cluster="ceph"} 1`),
+				regexp.MustCompile(`mgrs{cluster="ceph"} 3`),
+			},
+		},
+		{
+			input: `
+{
+    "servicemap": {
+        "epoch": 30,
+        "modified": "2020-07-13 22:21:53.278589",
+        "services": {
+            "rbd-mirror": {
+                "daemons": {
+                    "summary": "",
+                    "prod-mon01-block01": {
+                        "addr": "10.78.41.10:0/1272328707",
+                        "metadata": {
+                            "arch": "x86_64"
+                        }
+                    },
+                    "prod-mon02-block01": {
+                        "addr": "10.78.41.11:0/2337288266",
+                        "metadata": {
+                            "arch": "x86_64"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}`,
+			regexes: []*regexp.Regexp{
+				regexp.MustCompile(`rbd_mirror_up{cluster="ceph",\s*name="prod-mon01-block01"} 1`),
+				regexp.MustCompile(`rbd_mirror_up{cluster="ceph",\s*name="prod-mon02-block01"} 1`),
 			},
 		},
 	} {

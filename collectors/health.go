@@ -144,6 +144,12 @@ type ClusterHealthCollector struct {
 	// DownPGs depicts no. of PGs that are currently down and not able to serve traffic.
 	DownPGs prometheus.Gauge
 
+	// IncompletePGs depicts no. of PGs that are currently incomplete and not able to serve traffic.
+	IncompletePGs prometheus.Gauge
+
+	// InconsistentPGs depicts no. of PGs that are currently inconsistent
+	InconsistentPGs prometheus.Gauge
+
 	// SlowRequests depicts no. of total slow requests in the cluster
 	// This stat exists only for backwards compatbility.
 	SlowRequests prometheus.Gauge
@@ -231,6 +237,15 @@ type ClusterHealthCollector struct {
 
 	// CachePromoteIOOps shows the rate of operations promoting objects to the cache pool.
 	CachePromoteIOOps prometheus.Gauge
+
+	// MgrsActive shows the number of active mgrs, can be either 0 or 1.
+	MgrsActive prometheus.Gauge
+
+	// MgrsNum shows the total number of mgrs, including standbys.
+	MgrsNum prometheus.Gauge
+
+	// RbdMirrorUp shows the alive rbd-mirror daemons
+	RbdMirrorUp *prometheus.Desc
 }
 
 const (
@@ -439,6 +454,22 @@ func NewClusterHealthCollector(conn Conn, cluster string) *ClusterHealthCollecto
 				Namespace:   cephNamespace,
 				Name:        "down_pgs",
 				Help:        "No. of PGs in the cluster in down state",
+				ConstLabels: labels,
+			},
+		),
+		IncompletePGs: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace:   cephNamespace,
+				Name:        "incomplete_pgs",
+				Help:        "No. of PGs in the cluster in incomplete state",
+				ConstLabels: labels,
+			},
+		),
+		InconsistentPGs: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace:   cephNamespace,
+				Name:        "inconsistent_pgs",
+				Help:        "No. of PGs in the cluster in inconsistent state",
 				ConstLabels: labels,
 			},
 		),
@@ -784,6 +815,28 @@ func NewClusterHealthCollector(conn Conn, cluster string) *ClusterHealthCollecto
 				ConstLabels: labels,
 			},
 		),
+		MgrsActive: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace:   cephNamespace,
+				Name:        "mgrs_active",
+				Help:        "Count of active mgrs, can be either 0 or 1",
+				ConstLabels: labels,
+			},
+		),
+		MgrsNum: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Namespace:   cephNamespace,
+				Name:        "mgrs",
+				Help:        "Total number of mgrs, including standbys",
+				ConstLabels: labels,
+			},
+		),
+		RbdMirrorUp: prometheus.NewDesc(
+			fmt.Sprintf("%s_rbd_mirror_up", cephNamespace),
+			"Alive rbd-mirror daemons",
+			[]string{"name"},
+			labels,
+		),
 	}
 }
 
@@ -811,6 +864,8 @@ func (c *ClusterHealthCollector) metricsList() []prometheus.Metric {
 		c.ForcedRecoveryPGs,
 		c.ForcedBackfillPGs,
 		c.DownPGs,
+		c.IncompletePGs,
+		c.InconsistentPGs,
 		c.SlowRequests,
 		c.StuckRequests,
 		c.DegradedObjectsCount,
@@ -844,6 +899,8 @@ func (c *ClusterHealthCollector) metricsList() []prometheus.Metric {
 		c.CacheFlushIORate,
 		c.CacheEvictIORate,
 		c.CachePromoteIOOps,
+		c.MgrsActive,
+		c.MgrsNum,
 	}
 }
 
@@ -895,6 +952,19 @@ type cephHealthStats struct {
 			States string  `json:"state_name"`
 		} `json:"pgs_by_state"`
 	} `json:"pgmap"`
+	MgrMap struct {
+		ActiveName string `json:"active_name"`
+		StandBys   []struct {
+			Name string `json:"name"`
+		} `json:"standbys"`
+	} `json:"mgrmap"`
+	ServiceMap struct {
+		Services struct {
+			RbdMirror struct {
+				Daemons map[string]interface{} `json:"daemons"`
+			} `json:"rbd-mirror"`
+		} `json:"services"`
+	} `json:"servicemap"`
 }
 
 type cephHealthDetailStats struct {
@@ -1140,6 +1210,8 @@ func (c *ClusterHealthCollector) collect(ch chan<- prometheus.Metric) error {
 		forcedRecoveryPGs float64
 		forcedBackfillPGs float64
 		downPGs           float64
+		incompletePGs     float64
+		inconsistentPGs   float64
 
 		pgStateCounterMap = map[string]*float64{
 			"degraded":        &degradedPGs,
@@ -1157,6 +1229,8 @@ func (c *ClusterHealthCollector) collect(ch chan<- prometheus.Metric) error {
 			"forced_recovery": &forcedRecoveryPGs,
 			"forced_backfill": &forcedBackfillPGs,
 			"down":            &downPGs,
+			"incomplete":      &incompletePGs,
+			"inconsistent":    &inconsistentPGs,
 		}
 		pgStateGaugeMap = map[string]prometheus.Gauge{
 			"degraded":        c.DegradedPGs,
@@ -1174,6 +1248,8 @@ func (c *ClusterHealthCollector) collect(ch chan<- prometheus.Metric) error {
 			"forced_recovery": c.ForcedRecoveryPGs,
 			"forced_backfill": c.ForcedBackfillPGs,
 			"down":            c.DownPGs,
+			"incomplete":      c.IncompletePGs,
+			"inconsistent":    c.InconsistentPGs,
 		}
 	)
 
@@ -1224,6 +1300,23 @@ func (c *ClusterHealthCollector) collect(ch chan<- prometheus.Metric) error {
 		if err := c.calculateSlowRequestsPerOSD(ch, checkType); err != nil {
 			return err
 		}
+	}
+
+	activeMgr := 0
+	if len(stats.MgrMap.ActiveName) > 0 {
+		activeMgr = 1
+	}
+
+	c.MgrsActive.Set(float64(activeMgr))
+	c.MgrsNum.Set(float64(activeMgr + len(stats.MgrMap.StandBys)))
+
+	for name := range stats.ServiceMap.Services.RbdMirror.Daemons {
+		if name == "summary" {
+			continue
+		}
+
+		ch <- prometheus.MustNewConstMetric(
+			c.RbdMirrorUp, prometheus.GaugeValue, 1.0, name)
 	}
 
 	return nil
@@ -1648,6 +1741,7 @@ func (c *ClusterHealthCollector) collectCacheIO(clientStr string) error {
 // to the provided prometheus channel.
 func (c *ClusterHealthCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.SlowRequestsByOSDDesc
+	ch <- c.RbdMirrorUp
 
 	for _, metric := range c.metricsList() {
 		ch <- metric.Desc()

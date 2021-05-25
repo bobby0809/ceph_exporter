@@ -16,7 +16,10 @@ package collectors
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"math"
+	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -49,13 +52,16 @@ type PoolInfoCollector struct {
 
 	// StripeWidth contains width of a RADOS object in a pool.
 	StripeWidth *prometheus.GaugeVec
+
+	// ExpansionFactor Contains a float >= 1 that defines the EC or replication multiplier of a pool
+	ExpansionFactor *prometheus.GaugeVec
 }
 
 // NewPoolInfoCollector displays information about each pool in the cluster.
 func NewPoolInfoCollector(conn Conn, cluster string) *PoolInfoCollector {
 	var (
 		subSystem  = "pool"
-		poolLabels = []string{"pool", "profile"}
+		poolLabels = []string{"pool", "profile", "root"}
 	)
 
 	labels := make(prometheus.Labels)
@@ -134,6 +140,16 @@ func NewPoolInfoCollector(conn Conn, cluster string) *PoolInfoCollector {
 			},
 			poolLabels,
 		),
+		ExpansionFactor: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace:   cephNamespace,
+				Subsystem:   subSystem,
+				Name:        "expansion_factor",
+				Help:        "Data expansion multiplier for a pool",
+				ConstLabels: labels,
+			},
+			poolLabels,
+		),
 	}
 }
 
@@ -146,21 +162,25 @@ func (p *PoolInfoCollector) collectorList() []prometheus.Collector {
 		p.QuotaMaxBytes,
 		p.QuotaMaxObjects,
 		p.StripeWidth,
+		p.ExpansionFactor,
 	}
 }
 
+type poolInfo struct {
+	Name            string  `json:"pool_name"`
+	ActualSize      float64 `json:"size"`
+	MinSize         float64 `json:"min_size"`
+	PGNum           float64 `json:"pg_num"`
+	PlacementPGNum  float64 `json:"pg_placement_num"`
+	QuotaMaxBytes   float64 `json:"quota_max_bytes"`
+	QuotaMaxObjects float64 `json:"quota_max_objects"`
+	Profile         string  `json:"erasure_code_profile"`
+	StripeWidth     float64 `json:"stripe_width"`
+	CrushRule       int64   `json:"crush_rule"`
+}
+
 type cephPoolInfo struct {
-	Pools []struct {
-		Name            string  `json:"pool_name"`
-		ActualSize      float64 `json:"size"`
-		MinSize         float64 `json:"min_size"`
-		PGNum           float64 `json:"pg_num"`
-		PlacementPGNum  float64 `json:"pg_placement_num"`
-		QuotaMaxBytes   float64 `json:"quota_max_bytes"`
-		QuotaMaxObjects float64 `json:"quota_max_objects"`
-		Profile         string  `json:"erasure_code_profile"`
-		StripeWidth     float64 `json:"stripe_width"`
-	}
+	Pools []poolInfo
 }
 
 func (p *PoolInfoCollector) collect() error {
@@ -169,6 +189,8 @@ func (p *PoolInfoCollector) collect() error {
 	if err != nil {
 		return err
 	}
+
+	ruleToRootMappings := p.getCrushRuleToRootMappings()
 
 	stats := &cephPoolInfo{}
 	if err := json.Unmarshal(buf, &stats.Pools); err != nil {
@@ -183,15 +205,18 @@ func (p *PoolInfoCollector) collect() error {
 	p.QuotaMaxBytes.Reset()
 	p.QuotaMaxObjects.Reset()
 	p.StripeWidth.Reset()
+	p.ExpansionFactor.Reset()
 
 	for _, pool := range stats.Pools {
-		p.PGNum.WithLabelValues(pool.Name, pool.Profile).Set(pool.PGNum)
-		p.PlacementPGNum.WithLabelValues(pool.Name, pool.Profile).Set(pool.PlacementPGNum)
-		p.MinSize.WithLabelValues(pool.Name, pool.Profile).Set(pool.MinSize)
-		p.ActualSize.WithLabelValues(pool.Name, pool.Profile).Set(pool.ActualSize)
-		p.QuotaMaxBytes.WithLabelValues(pool.Name, pool.Profile).Set(pool.QuotaMaxBytes)
-		p.QuotaMaxObjects.WithLabelValues(pool.Name, pool.Profile).Set(pool.QuotaMaxObjects)
-		p.StripeWidth.WithLabelValues(pool.Name, pool.Profile).Set(pool.StripeWidth)
+		labelValues := []string{pool.Name, pool.Profile, ruleToRootMappings[pool.CrushRule]}
+		p.PGNum.WithLabelValues(labelValues...).Set(pool.PGNum)
+		p.PlacementPGNum.WithLabelValues(labelValues...).Set(pool.PlacementPGNum)
+		p.MinSize.WithLabelValues(labelValues...).Set(pool.MinSize)
+		p.ActualSize.WithLabelValues(labelValues...).Set(pool.ActualSize)
+		p.QuotaMaxBytes.WithLabelValues(labelValues...).Set(pool.QuotaMaxBytes)
+		p.QuotaMaxObjects.WithLabelValues(labelValues...).Set(pool.QuotaMaxObjects)
+		p.StripeWidth.WithLabelValues(labelValues...).Set(pool.StripeWidth)
+		p.ExpansionFactor.WithLabelValues(labelValues...).Set(p.getExpansionFactor(pool))
 	}
 
 	return nil
@@ -230,4 +255,91 @@ func (p *PoolInfoCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, metric := range p.collectorList() {
 		metric.Collect(ch)
 	}
+}
+
+func (p *PoolInfoCollector) getExpansionFactor(pool poolInfo) float64 {
+	if ef, ok := p.getECExpansionFactor(pool); ok {
+		return ef
+	}
+	// Non-EC pool (or unable to get profile info); assume that it's replicated.
+	return pool.ActualSize
+}
+
+func (p *PoolInfoCollector) getECExpansionFactor(pool poolInfo) (float64, bool) {
+	prefix := fmt.Sprintf("osd erasure-code-profile get")
+	cmd, err := json.Marshal(map[string]interface{}{
+		"prefix": prefix,
+		"name":   pool.Profile,
+		"format": "json",
+	})
+
+	buf, _, err := p.conn.MonCommand(cmd)
+	if err != nil {
+		return -1, false
+	}
+
+	type ecInfo struct {
+		K string `json:"k"`
+		M string `json:"m"`
+	}
+
+	ecStats := ecInfo{}
+	err = json.Unmarshal(buf, &ecStats)
+	if err != nil || ecStats.K == "" || ecStats.M == "" {
+		return -1, false
+	}
+
+	k, _ := strconv.ParseFloat(ecStats.K, 64)
+	m, _ := strconv.ParseFloat(ecStats.M, 64)
+
+	expansionFactor := (k + m) / k
+	roundedExpansion := math.Round(expansionFactor*100) / 100
+	return roundedExpansion, true
+}
+
+func (p *PoolInfoCollector) getCrushRuleToRootMappings() map[int64]string {
+	mappings := make(map[int64]string)
+
+	cmd, err := json.Marshal(map[string]interface{}{
+		"prefix": "osd crush rule dump",
+		"format": "json",
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	buf, _, err := p.conn.MonCommand(cmd)
+	if err != nil {
+		return mappings
+	}
+
+	var rules []struct {
+		RuleID int64 `json:"rule_id"`
+		Steps  []struct {
+			ItemName string `json:"item_name"`
+			Op       string `json:"op"`
+		} `json:"steps"`
+	}
+
+	err = json.Unmarshal(buf, &rules)
+	if err != nil {
+		return mappings
+	}
+
+	for _, rule := range rules {
+		if len(rule.Steps) == 0 {
+			continue
+		}
+		for _, step := range rule.Steps {
+			// Although there can be multiple "take" steps, there
+			// usually aren't in practice. The "take" item isn't
+			// necessarily a crush root, but assuming so is good
+			// enough for most cases.
+			if step.Op == "take" {
+				mappings[rule.RuleID] = step.ItemName
+			}
+		}
+	}
+
+	return mappings
 }
